@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+
+# Local data snapshots (too large for regular git)
+data/blocks_full_with_types.csv
+data/*.bak
+data/*.tmp
+
+# Editor/OS
+.DS_Store
+.vscode/
+.idea/

@@ -1,0 +1,64 @@
+meta:
+  name: "Zcash NSM / Burns Visualizer"
+  version: 1
+
+paths:
+  blocks_csv: "data/blocks_full_with_types.csv"
+  events_burn_csv: "data/events_burn.csv"
+
+defaults:
+  nsm_activation_height: 3566401
+  horizon_end_height: 6400000
+  display_start_date_utc: "2019-01-01T00:00:00Z"
+
+issuance:
+  zip234:
+    numerator: 4126
+    denominator: 10000000000
+
+burns:
+  fee_burn:
+    ratio: 0.60
+
+sprout:
+  snapshot:
+    pool_sprout_zat: 2548104009822
+    measured_height: 3233397
+    measured_time_utc: "2026-02-08T00:00:00Z"
+
+future_activity:
+  anchor_blocks: 200000
+  default_profile: "linear"
+  default_preset: "base"
+  default_logistic_k: 0.80
+  presets:
+    conservative:
+      linear_k: 0.05
+      exp_k: 0.04
+    base:
+      linear_k: 0.10
+      exp_k: 0.08
+    aggressive:
+      linear_k: 0.20
+      exp_k: 0.14
+
+ui:
+  plot:
+    max_points: 20000
+    height_vh: 72
+  y_axis:
+    legacy_full_top_min: 52.0
+    adaptive_padding_ratio: 0.15
+    adaptive_padding_min: 0.02
+  markers:
+    line_width: 1
+    line_dash: "dash"
+    line_color: "#2f4f6f"
+    opacity: 0.75
+    label_font_size: 11
+    label_xshift: 2
+    label_yshift: -2
+
+model:
+  activation_rules:
+    enforce_from_nsm: true
