@@ -11,3 +11,7 @@ data/*.tmp
 .DS_Store
 .vscode/
 .idea/
+
+# Local SSH key files
+github
+github.pub

@@ -1,8 +1,2 @@
-#chart_wrap [data-dash-is-loading="true"] {
-  opacity: 0.42;
-  transition: opacity 0.2s ease;
-}
-#chart_wrap [data-dash-is-loading="false"] {
-  opacity: 1;
-  transition: opacity 0.2s ease;
-}
+/* Chart loading opacity is controlled explicitly from viz/app.py (chart_wrap.style).
+   Keep this file to avoid stale browser cache 404s from older builds. */

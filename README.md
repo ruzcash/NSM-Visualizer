@@ -18,6 +18,11 @@ Diagnostics panel (right side):
 - burn/reissue balance;
 - scenario checkpoints (scenario audit).
 
+Run flow:
+- update inputs/options first;
+- press `Run calculation` (or `Ctrl+Enter`) to apply changes;
+- the button highlights pending unapplied changes and shows in-progress state during recalculation.
+
 ## 2. Model invariants
 
 - Up to current tip (`max_height_csv`), facts from `data/blocks_full_with_types.csv` are used.
@@ -25,6 +30,7 @@ Diagnostics panel (right side):
 - Scenario effects are applied only from `NSM activation height` onward.
 - If block range input is invalid (`start_height > end_height`), heavy model computation is skipped.
 - Partial CSV datasets are handled via safe reindex/ffill logic to avoid crashes on missing heights.
+- Exact-mode performance guard: extremely large horizons are rejected to keep UI responsive on local machines.
 
 ## 3. ZIP logic in UI
 
@@ -183,6 +189,10 @@ python -m viz.app
 
 Open:
 - `http://127.0.0.1:8050`
+
+Usage:
+- after changing any input, click `Run calculation` to update the chart;
+- if range is invalid (`start > horizon`), the run button is disabled until fixed.
 
 Optional backend (if API health/snapshot endpoints are needed):
 

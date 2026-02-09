@@ -10,7 +10,10 @@
 from __future__ import annotations
 
 import math
+import os
 import traceback
+import threading
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
@@ -39,7 +42,10 @@ FIRST_HALVING_HEIGHT_DEFAULT = SECOND_HALVING_HEIGHT_DEFAULT - POST_BLOSSOM_HALV
 THIRD_HALVING_HEIGHT_DEFAULT = SECOND_HALVING_HEIGHT_DEFAULT + POST_BLOSSOM_HALVING_INTERVAL
 FUTURE_FEE_ANCHOR_BLOCKS = 200_000
 ZIP233_DEPENDENT_TOGGLES = {"fee_burn", "sprout_burn", "voluntary_burns"}
-REISSUE_BURNED_TOGGLES = {"reissue_burned"}
+# Safety limit for exact per-block modeling in pure Python.
+MAX_EXACT_END_HEIGHT = 12_000_000
+IMMUTABLE_BUCKET_SIZE = 250_000
+IMMUTABLE_CACHE_MAX_BUCKETS = 32
 
 
 # -----------------------------
@@ -601,7 +607,132 @@ DEFAULT_SPROUT_ZAT = int(sprout_snap["pool_sprout_zat"])
 DEFAULT_SPROUT_HEIGHT_HINT = int(sprout_snap.get("measured_height", DEFAULT_NSM_HEIGHT))
 DEFAULT_SPROUT_TIME_HINT = str(sprout_snap.get("measured_time_utc", ""))
 
-app = Dash(__name__)
+# -----------------------------
+# Caching / async warmup (perf)
+# -----------------------------
+_CACHE_LOCK = threading.Lock()
+_DATA_CACHE_KEY: Optional[Tuple] = None
+_DATA_CACHE_BLOCKS: Optional[pd.DataFrame] = None
+_DATA_CACHE_EVENTS: Optional[pd.DataFrame] = None
+
+_IMMUTABLE_CACHE: dict[Tuple[Tuple, int], dict] = {}
+_IMMUTABLE_CACHE_LRU: list[Tuple[Tuple, int]] = []
+_WARM_FUTURES: dict[Tuple[Tuple, int], Future] = {}
+_WARM_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="nsm-warm")
+
+
+def _file_sig(path: str) -> Tuple[int, int]:
+    try:
+        st = os.stat(path)
+        return (int(st.st_mtime_ns), int(st.st_size))
+    except FileNotFoundError:
+        return (0, 0)
+
+
+def _data_sig_key() -> Tuple:
+    return (_file_sig(blocks_path), _file_sig(events_path))
+
+
+def _load_data_cached() -> Tuple[pd.DataFrame, pd.DataFrame, bool]:
+    global _DATA_CACHE_KEY, _DATA_CACHE_BLOCKS, _DATA_CACHE_EVENTS
+    key = _data_sig_key()
+    with _CACHE_LOCK:
+        if _DATA_CACHE_KEY == key and _DATA_CACHE_BLOCKS is not None and _DATA_CACHE_EVENTS is not None:
+            return _DATA_CACHE_BLOCKS.copy(), _DATA_CACHE_EVENTS.copy(), True
+
+    blocks_df = load_blocks_csv(blocks_path)
+    events_df = load_burn_events_csv(events_path)
+    with _CACHE_LOCK:
+        _DATA_CACHE_KEY = key
+        _DATA_CACHE_BLOCKS = blocks_df.copy()
+        _DATA_CACHE_EVENTS = events_df.copy()
+    return blocks_df, events_df, False
+
+
+def _build_immutable_bundle(blocks_df: pd.DataFrame, bundle_end_h: int) -> dict:
+    heights = np.arange(0, bundle_end_h + 1, dtype=int)
+    time_axis = extend_time_axis(blocks_df, bundle_end_h)
+    base_subsidy = build_status_quo_subsidy(
+        heights=heights,
+        blocks_df=blocks_df,
+        second_halving_height=SECOND_HALVING_HEIGHT_DEFAULT,
+        halving_interval=POST_BLOSSOM_HALVING_INTERVAL,
+    )
+    base_issued = compute_issued_supply(
+        heights=heights,
+        blocks_df=blocks_df,
+        subsidy_zat=base_subsidy,
+        max_money_zat=MAX_MONEY_ZAT,
+    )
+    return {
+        "end_h": bundle_end_h,
+        "heights": heights,
+        "time_axis": time_axis,
+        "base_subsidy": base_subsidy,
+        "base_issued": base_issued,
+    }
+
+
+def _cache_put_immutable(data_key: Tuple, bundle_end_h: int, bundle: dict) -> None:
+    cache_key = (data_key, bundle_end_h)
+    with _CACHE_LOCK:
+        _IMMUTABLE_CACHE[cache_key] = bundle
+        if cache_key in _IMMUTABLE_CACHE_LRU:
+            _IMMUTABLE_CACHE_LRU.remove(cache_key)
+        _IMMUTABLE_CACHE_LRU.append(cache_key)
+        while len(_IMMUTABLE_CACHE_LRU) > IMMUTABLE_CACHE_MAX_BUCKETS:
+            evict = _IMMUTABLE_CACHE_LRU.pop(0)
+            _IMMUTABLE_CACHE.pop(evict, None)
+            _WARM_FUTURES.pop(evict, None)
+
+
+def _schedule_warm_bundle(blocks_df: pd.DataFrame, data_key: Tuple, bundle_end_h: int) -> None:
+    if bundle_end_h > MAX_EXACT_END_HEIGHT:
+        return
+    cache_key = (data_key, bundle_end_h)
+    with _CACHE_LOCK:
+        if cache_key in _IMMUTABLE_CACHE:
+            return
+        fut = _WARM_FUTURES.get(cache_key)
+        if fut is not None and not fut.done():
+            return
+        _WARM_FUTURES[cache_key] = _WARM_POOL.submit(_build_immutable_bundle, blocks_df.copy(), bundle_end_h)
+
+
+def _get_immutable_bundle(blocks_df: pd.DataFrame, end_h: int, data_key: Tuple) -> Tuple[dict, str]:
+    bucket_end_h = int(math.ceil(end_h / IMMUTABLE_BUCKET_SIZE) * IMMUTABLE_BUCKET_SIZE)
+    bucket_end_h = min(MAX_EXACT_END_HEIGHT, bucket_end_h)
+    cache_key = (data_key, bucket_end_h)
+
+    with _CACHE_LOCK:
+        cached = _IMMUTABLE_CACHE.get(cache_key)
+        fut = _WARM_FUTURES.get(cache_key)
+
+    if cached is not None:
+        note = f"immutable cache: hit bucket_end={bucket_end_h}"
+        bundle = cached
+    elif fut is not None and fut.done():
+        try:
+            bundle = fut.result()
+            _cache_put_immutable(data_key, bucket_end_h, bundle)
+            note = f"immutable cache: warm-hit bucket_end={bucket_end_h}"
+        except Exception:
+            bundle = _build_immutable_bundle(blocks_df, bucket_end_h)
+            _cache_put_immutable(data_key, bucket_end_h, bundle)
+            note = f"immutable cache: warm-failed -> sync bucket_end={bucket_end_h}"
+    else:
+        bundle = _build_immutable_bundle(blocks_df, bucket_end_h)
+        _cache_put_immutable(data_key, bucket_end_h, bundle)
+        note = f"immutable cache: miss bucket_end={bucket_end_h}"
+
+    next_bucket = bucket_end_h + IMMUTABLE_BUCKET_SIZE
+    _schedule_warm_bundle(blocks_df, data_key, next_bucket)
+    return bundle, note
+
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+ASSETS_DIR = os.path.join(PROJECT_ROOT, "assets")
+
+app = Dash(__name__, update_title=None, assets_folder=ASSETS_DIR)
 app.title = "Zcash NSM / Burns Visualizer"
 
 app.layout = html.Div(
@@ -653,12 +784,17 @@ app.layout = html.Div(
                                     type="number",
                                     value=None,
                                     min=0,
+                                    max=MAX_EXACT_END_HEIGHT,
                                     step="any",
                                     placeholder=f"default = {DEFAULT_HORIZON_HEIGHT}",
                                     style={"width": "100%"},
                                 ),
                                 html.Button("+1M", id="horizon_plus_1m", n_clicks=0),
                             ],
+                        ),
+                        html.Div(
+                            f"Exact-mode horizon limit: {MAX_EXACT_END_HEIGHT:,} blocks.",
+                            style={"fontSize": "12px", "opacity": 0.75, "marginTop": "4px"},
                         ),
                         html.Div(style={"height": "8px"}),
                         html.Div("NSM activation height"),
@@ -667,6 +803,18 @@ app.layout = html.Div(
                             type="number",
                             value=DEFAULT_NSM_HEIGHT,
                             style={"width": "100%"},
+                        ),
+                        html.Div(style={"height": "8px"}),
+                        html.Button(
+                            "Run calculation",
+                            id="run_calc",
+                            n_clicks=0,
+                            style={"width": "100%", "fontWeight": "600"},
+                        ),
+                        html.Div(
+                            id="run_hint",
+                            children="No pending changes.",
+                            style={"marginTop": "6px", "fontSize": "12px", "opacity": 0.8},
                         ),
                     ]
                 ),
@@ -763,6 +911,10 @@ app.layout = html.Div(
                     children=[
                         html.H4(id="chart_title", style={"margin": "0 0 6px 0"}),
                         html.Div(
+                            id="calc_status",
+                            style={"margin": "0 0 6px 0", "fontSize": "13px", "fontWeight": "600"},
+                        ),
+                        html.Div(
                             id="chart_wrap",
                             children=[
                                 dcc.Graph(id="supply_chart", style={"height": f"{PLOT_HEIGHT_VH}vh"}),
@@ -778,7 +930,7 @@ app.layout = html.Div(
                 ),
             ],
         ),
-        dcc.Interval(id="interval_refresh", interval=60_000, n_intervals=0),
+        dcc.Interval(id="interval_refresh", interval=800, n_intervals=0),
     ],
 )
 
@@ -791,8 +943,10 @@ app.layout = html.Div(
 def validate_range_styles(horizon_end_height, start_height):
     normal = {"width": "100%"}
     error = {"width": "100%", "border": "2px solid #d93025", "backgroundColor": "#fff5f5"}
-    if horizon_end_height is not None and start_height is not None:
-        h = _to_int(horizon_end_height, DEFAULT_HORIZON_HEIGHT)
+    h = _to_int(horizon_end_height, DEFAULT_HORIZON_HEIGHT)
+    if h > MAX_EXACT_END_HEIGHT:
+        return error, normal
+    if start_height is not None:
         s = _to_int(start_height, 0)
         if s > h:
             return error, error
@@ -858,8 +1012,8 @@ def nudge_horizon_by_million(_minus, _plus, horizon_value):
     if trigger == "horizon_minus_1m":
         return max(0, base - 1_000_000)
     if trigger == "horizon_plus_1m":
-        return max(0, base + 1_000_000)
-    return base
+        return min(MAX_EXACT_END_HEIGHT, max(0, base + 1_000_000))
+    return min(MAX_EXACT_END_HEIGHT, max(0, base))
 
 
 @app.callback(
@@ -880,10 +1034,13 @@ def nudge_start_by_million(_minus, _plus, start_value):
 
 
 @app.callback(
-    Output("chart_title", "children"),
-    Output("supply_chart", "figure"),
-    Output("diag", "children"),
+    Output("run_calc", "style"),
+    Output("run_calc", "children"),
+    Output("run_hint", "children"),
+    Output("run_hint", "style"),
+    Output("run_calc", "disabled"),
     Input("interval_refresh", "n_intervals"),
+    Input("run_calc", "n_clicks"),
     Input("x_axis_mode", "value"),
     Input("horizon_end_height", "value"),
     Input("start_height", "value"),
@@ -895,7 +1052,227 @@ def nudge_start_by_million(_minus, _plus, start_value):
     Input("sprout_burn_amount", "value"),
     Input("sprout_burn_height", "value"),
 )
-def update_chart(
+def sync_run_button_state(
+    _tick,
+    _run_clicks,
+    x_axis_mode,
+    horizon_end_height,
+    start_height,
+    nsm_height,
+    toggles,
+    future_profile,
+    future_preset,
+    fee_burn_ratio,
+    sprout_burn_amount,
+    sprout_burn_height,
+):
+    effective_horizon = _to_int(horizon_end_height, DEFAULT_HORIZON_HEIGHT)
+    effective_horizon = max(0, effective_horizon)
+    invalid_range = False
+    if effective_horizon > MAX_EXACT_END_HEIGHT:
+        invalid_range = True
+    if start_height is not None:
+        start_v = _to_int(start_height, 0)
+        if start_v > effective_horizon:
+            invalid_range = True
+
+    if invalid_range:
+        return (
+            _run_button_invalid_style(),
+            "Fix input range",
+            "Invalid range: start height must be <= horizon height.",
+            _run_hint_invalid_style(),
+            True,
+        )
+
+    current_key = _build_request_key(
+        x_axis_mode=x_axis_mode,
+        horizon_end_height=horizon_end_height,
+        start_height=start_height,
+        nsm_height=nsm_height,
+        toggles=toggles,
+        future_profile=future_profile,
+        future_preset=future_preset,
+        fee_burn_ratio=fee_burn_ratio,
+        sprout_burn_amount=sprout_burn_amount,
+        sprout_burn_height=sprout_burn_height,
+    )
+    with _CALC_LOCK:
+        active_key = _ACTIVE_REQUEST_KEY
+        active_future = _CALC_FUTURES.get(active_key) if active_key is not None else None
+    dirty = active_key is None or current_key != active_key
+    running = bool(active_future is not None and not active_future.done())
+
+    if dirty:
+        return (
+            _run_button_dirty_style(),
+            "Run calculation (changes pending)",
+            "You have unapplied changes. Press Run calculation. Tip: Ctrl+Enter.",
+            _run_hint_dirty_style(),
+            False,
+        )
+    if running:
+        return (
+            _run_button_running_style(),
+            "Calculation in progress...",
+            "Model recalculation is running in background.",
+            _run_hint_running_style(),
+            True,
+        )
+    return (
+        _run_button_base_style(),
+        "Run calculation",
+        "No pending changes. Tip: Ctrl+Enter runs calculation.",
+        _run_hint_base_style(),
+        False,
+    )
+
+
+_CALC_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="nsm-calc")
+_CALC_LOCK = threading.Lock()
+_CALC_FUTURES: dict[Tuple, Future] = {}
+_CALC_RESULTS: dict[Tuple, Tuple[str, go.Figure, str]] = {}
+_CALC_RESULTS_LRU: list[Tuple] = []
+_CALC_RESULTS_MAX = 12
+_LAST_RENDERED_RESULT: Optional[Tuple[str, go.Figure, str]] = None
+_ACTIVE_REQUEST_KEY: Optional[Tuple] = None
+_CALC_ARGS_BY_KEY: dict[Tuple, Tuple] = {}
+
+
+def _run_button_base_style() -> dict:
+    return {
+        "width": "100%",
+        "fontWeight": "600",
+        "border": "1px solid #9aa0a6",
+        "backgroundColor": "#f5f6f8",
+        "color": "#1f2937",
+    }
+
+
+def _run_button_dirty_style() -> dict:
+    return {
+        "width": "100%",
+        "fontWeight": "700",
+        "border": "1px solid #6e1023",
+        "backgroundColor": "#8b1538",
+        "color": "#ffffff",
+    }
+
+
+def _run_button_running_style() -> dict:
+    return {
+        "width": "100%",
+        "fontWeight": "700",
+        "border": "1px solid #995c00",
+        "backgroundColor": "#b26a00",
+        "color": "#ffffff",
+    }
+
+
+def _run_button_invalid_style() -> dict:
+    return {
+        "width": "100%",
+        "fontWeight": "700",
+        "border": "1px solid #8b0000",
+        "backgroundColor": "#b91c1c",
+        "color": "#ffffff",
+    }
+
+
+def _run_hint_base_style() -> dict:
+    return {"marginTop": "6px", "fontSize": "12px", "opacity": 0.8, "color": "#374151"}
+
+
+def _run_hint_dirty_style() -> dict:
+    return {"marginTop": "6px", "fontSize": "12px", "opacity": 0.95, "color": "#6e1023", "fontWeight": "600"}
+
+
+def _run_hint_running_style() -> dict:
+    return {"marginTop": "6px", "fontSize": "12px", "opacity": 0.95, "color": "#8a4b00", "fontWeight": "600"}
+
+
+def _run_hint_invalid_style() -> dict:
+    return {"marginTop": "6px", "fontSize": "12px", "opacity": 0.95, "color": "#8b0000", "fontWeight": "700"}
+
+
+def _chart_wrap_ready_style() -> dict:
+    return {"opacity": 1.0, "transition": "opacity 0.2s ease"}
+
+
+def _chart_wrap_busy_style() -> dict:
+    return {"opacity": 0.46, "transition": "opacity 0.2s ease"}
+
+
+def _store_calc_result(key: Tuple, result: Tuple[str, go.Figure, str]) -> None:
+    global _LAST_RENDERED_RESULT
+    with _CALC_LOCK:
+        _CALC_RESULTS[key] = result
+        if key in _CALC_RESULTS_LRU:
+            _CALC_RESULTS_LRU.remove(key)
+        _CALC_RESULTS_LRU.append(key)
+        while len(_CALC_RESULTS_LRU) > _CALC_RESULTS_MAX:
+            old = _CALC_RESULTS_LRU.pop(0)
+            _CALC_RESULTS.pop(old, None)
+        _LAST_RENDERED_RESULT = result
+
+
+def _build_request_key(
+    x_axis_mode,
+    horizon_end_height,
+    start_height,
+    nsm_height,
+    toggles,
+    future_profile,
+    future_preset,
+    fee_burn_ratio,
+    sprout_burn_amount,
+    sprout_burn_height,
+) -> Tuple:
+    return (
+        _data_sig_key(),
+        str(x_axis_mode or "date"),
+        None if horizon_end_height is None else int(_to_int(horizon_end_height, DEFAULT_HORIZON_HEIGHT)),
+        None if start_height is None else int(_to_int(start_height, 0)),
+        int(_to_int(nsm_height, DEFAULT_NSM_HEIGHT)),
+        tuple(sorted(list(toggles or []))),
+        str(future_profile or DEFAULT_FUTURE_PROFILE).lower(),
+        str(future_preset or DEFAULT_FUTURE_PRESET).lower(),
+        str(fee_burn_ratio),
+        int(_to_int(sprout_burn_amount, DEFAULT_SPROUT_ZAT)),
+        int(_to_int(sprout_burn_height, DEFAULT_NSM_HEIGHT)),
+    )
+
+
+def _render_pending_state(req_key: Tuple) -> Tuple[str, go.Figure, str]:
+    with _CALC_LOCK:
+        last = _LAST_RENDERED_RESULT
+        pending = list(_CALC_FUTURES.keys())
+    if last is None:
+        fig = go.Figure()
+        fig.update_layout(
+            title=None,
+            xaxis_title="Date (UTC)",
+            yaxis_title="Inflation (%/year)",
+        )
+        diag = (
+            "calculation in progress:\n"
+            "- waiting for first completed result.\n"
+            f"- active jobs: {len(pending)}\n"
+            f"- request key hash: {hash(req_key)}"
+        )
+        return "Zcash Inflation Chart - Calculating", fig, diag
+    title, fig, diag = last
+    diag_pending = (
+        "calculation in progress:\n"
+        f"- active jobs: {len(pending)}\n"
+        f"- request key hash: {hash(req_key)}\n\n"
+        "last completed result:\n"
+        f"{diag}"
+    )
+    return title, fig, diag_pending
+
+
+def _compute_chart_sync(
     _tick,
     x_axis_mode,
     horizon_end_height,
@@ -915,7 +1292,27 @@ def update_chart(
         # Fast fail: obviously invalid numeric range should not trigger heavy model work.
         raw_end_h = None if horizon_end_height is None else _to_int(horizon_end_height, DEFAULT_HORIZON_HEIGHT)
         raw_start_h = None if start_height is None else _to_int(start_height, 0)
-        if raw_end_h is not None and raw_start_h is not None and raw_start_h > raw_end_h:
+        effective_end_h_for_validation = _to_int(horizon_end_height, DEFAULT_HORIZON_HEIGHT)
+        effective_end_h_for_validation = max(0, effective_end_h_for_validation)
+        if raw_end_h is not None and raw_end_h > MAX_EXACT_END_HEIGHT:
+            fig = go.Figure()
+            fig.update_layout(
+                title=None,
+                xaxis_title="Date (UTC)",
+                yaxis_title="Inflation (%/year)",
+            )
+            diag = (
+                "performance guard:\n"
+                f"- requested end_height={raw_end_h} exceeds exact-mode limit {MAX_EXACT_END_HEIGHT}.\n"
+                "- choose a lower horizon to avoid long blocking recalculation.\n"
+                "- note: this limit does not change ZIP logic; it protects local UI responsiveness."
+            )
+            return (
+                "Zcash Inflation Chart - Performance Guard",
+                fig,
+                diag,
+            )
+        if raw_start_h is not None and raw_start_h > effective_end_h_for_validation:
             fig = go.Figure()
             fig.update_layout(
                 title=None,
@@ -924,7 +1321,7 @@ def update_chart(
             )
             diag = (
                 "input validation error:\n"
-                f"- start_height ({raw_start_h}) cannot be greater than horizon_end_height ({raw_end_h}).\n"
+                f"- start_height ({raw_start_h}) cannot be greater than horizon_end_height ({effective_end_h_for_validation}).\n"
                 "- Fix inputs to continue."
             )
             return (
@@ -933,9 +1330,8 @@ def update_chart(
                 diag,
             )
 
-        # Load data (CSV can be mid-download; keep robust)
-        blocks_df = load_blocks_csv(blocks_path)
-        burn_events_df = load_burn_events_csv(events_path)
+        # Load data with mtime/size-aware cache.
+        blocks_df, burn_events_df, data_cache_hit = _load_data_cached()
 
         blocks_df = blocks_df.copy()
         blocks_df["height"] = pd.to_numeric(blocks_df["height"], errors="coerce").fillna(0).astype(int)
@@ -976,22 +1372,15 @@ def update_chart(
                 f"default configured start ({default_start_h}) is above horizon ({end_h}); using genesis start (0)"
             )
 
-        heights = np.arange(0, end_h + 1, dtype=int)
-        time_axis = extend_time_axis(blocks_df, end_h)
-
-        # Status quo subsidy and issued supply
-        base_subsidy = build_status_quo_subsidy(
-            heights=heights,
-            blocks_df=blocks_df,
-            second_halving_height=SECOND_HALVING_HEIGHT_DEFAULT,
-            halving_interval=POST_BLOSSOM_HALVING_INTERVAL,
-        )
-        base_issued = compute_issued_supply(
-            heights=heights,
-            blocks_df=blocks_df,
-            subsidy_zat=base_subsidy,
-            max_money_zat=MAX_MONEY_ZAT,
-        )
+        # Immutable core series (height/time/status-quo) from bucket cache.
+        data_key = _data_sig_key()
+        immutable_bundle, immutable_note = _get_immutable_bundle(blocks_df, end_h, data_key)
+        heights = immutable_bundle["heights"][: end_h + 1]
+        time_axis = immutable_bundle["time_axis"].iloc[: end_h + 1]
+        base_subsidy = immutable_bundle["base_subsidy"][: end_h + 1]
+        base_issued = immutable_bundle["base_issued"][: end_h + 1]
+        parse_notes.append(immutable_note)
+        parse_notes.append(f"data cache: {'hit' if data_cache_hit else 'miss'}")
 
         # Scenario subsidy (ZIP234 or baseline)
         enable_zip234 = "zip234" in toggles
@@ -1388,6 +1777,148 @@ def update_chart(
             fig,
             traceback.format_exc(),
         )
+
+
+@app.callback(
+    Output("chart_title", "children"),
+    Output("supply_chart", "figure"),
+    Output("diag", "children"),
+    Output("calc_status", "children"),
+    Output("calc_status", "style"),
+    Output("chart_wrap", "style"),
+    Input("interval_refresh", "n_intervals"),
+    Input("run_calc", "n_clicks"),
+    State("x_axis_mode", "value"),
+    State("horizon_end_height", "value"),
+    State("start_height", "value"),
+    State("nsm_height", "value"),
+    State("toggles", "value"),
+    State("future_profile", "value"),
+    State("future_preset", "value"),
+    State("fee_burn_ratio", "value"),
+    State("sprout_burn_amount", "value"),
+    State("sprout_burn_height", "value"),
+)
+def update_chart(
+    _tick,
+    _run_clicks,
+    x_axis_mode,
+    horizon_end_height,
+    start_height,
+    nsm_height,
+    toggles,
+    future_profile,
+    future_preset,
+    fee_burn_ratio,
+    sprout_burn_amount,
+    sprout_burn_height,
+):
+    global _ACTIVE_REQUEST_KEY
+
+    req_args = (
+        _tick,
+        x_axis_mode,
+        horizon_end_height,
+        start_height,
+        nsm_height,
+        toggles,
+        future_profile,
+        future_preset,
+        fee_burn_ratio,
+        sprout_burn_amount,
+        sprout_burn_height,
+    )
+
+    trigger = ctx.triggered_id
+    if trigger == "run_calc" or _ACTIVE_REQUEST_KEY is None:
+        req_key = _build_request_key(
+            x_axis_mode=x_axis_mode,
+            horizon_end_height=horizon_end_height,
+            start_height=start_height,
+            nsm_height=nsm_height,
+            toggles=toggles,
+            future_profile=future_profile,
+            future_preset=future_preset,
+            fee_burn_ratio=fee_burn_ratio,
+            sprout_burn_amount=sprout_burn_amount,
+            sprout_burn_height=sprout_burn_height,
+        )
+        _ACTIVE_REQUEST_KEY = req_key
+        with _CALC_LOCK:
+            _CALC_ARGS_BY_KEY[req_key] = req_args
+    else:
+        req_key = _ACTIVE_REQUEST_KEY
+
+    with _CALC_LOCK:
+        ready = _CALC_RESULTS.get(req_key)
+        fut = _CALC_FUTURES.get(req_key)
+
+    if ready is not None:
+        return (
+            ready[0],
+            ready[1],
+            ready[2],
+            "Status: ready",
+            {"margin": "0 0 6px 0", "fontSize": "13px", "fontWeight": "600", "color": "#1b5e20"},
+            _chart_wrap_ready_style(),
+        )
+
+    if fut is not None:
+        if fut.done():
+            try:
+                result = fut.result()
+            except Exception:
+                fig = go.Figure()
+                fig.update_layout(
+                    title="Zcash Supply (error; see diagnostics)",
+                    xaxis_title="Height",
+                    yaxis_title="ZEC",
+                )
+                result = (
+                    "Zcash Inflation Chart - Error (see Diagnostics)",
+                    fig,
+                    traceback.format_exc(),
+                )
+            with _CALC_LOCK:
+                _CALC_FUTURES.pop(req_key, None)
+            _store_calc_result(req_key, result)
+            return (
+                result[0],
+                result[1],
+                result[2],
+                "Status: ready",
+                {"margin": "0 0 6px 0", "fontSize": "13px", "fontWeight": "600", "color": "#1b5e20"},
+                _chart_wrap_ready_style(),
+            )
+        pending = _render_pending_state(req_key)
+        return (
+            pending[0],
+            pending[1],
+            pending[2],
+            "Status: calculating...",
+            {"margin": "0 0 6px 0", "fontSize": "13px", "fontWeight": "600", "color": "#8a4b00"},
+            _chart_wrap_busy_style(),
+        )
+
+    with _CALC_LOCK:
+        for k, old_f in list(_CALC_FUTURES.items()):
+            if k != req_key and not old_f.running() and not old_f.done():
+                old_f.cancel()
+                _CALC_FUTURES.pop(k, None)
+        args = _CALC_ARGS_BY_KEY.get(req_key, req_args)
+        _CALC_FUTURES[req_key] = _CALC_POOL.submit(
+            _compute_chart_sync,
+            *args,
+        )
+    pending = _render_pending_state(req_key)
+    return (
+        pending[0],
+        pending[1],
+        pending[2],
+        "Status: calculating...",
+        {"margin": "0 0 6px 0", "fontSize": "13px", "fontWeight": "600", "color": "#8a4b00"},
+        _chart_wrap_busy_style(),
+    )
 
 
 if __name__ == "__main__":
