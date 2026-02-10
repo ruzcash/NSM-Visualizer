@@ -75,7 +75,6 @@ where:
 - `data/blocks_full_with_types.csv` - factual base dataset.
 - `data/compile_chain.py` - offline compiler from CSV to `data/compiled/chain_v1.npz`.
 - `data/events_burn.csv` - voluntary burn events.
-- `data/update_fees_last_million.py` - `fees_zat` updater via RPC.
 - `backend/app.py` - optional FastAPI helper backend (snapshot/RPC health endpoints).
 
 ## 6. `config/config.yaml` reference
