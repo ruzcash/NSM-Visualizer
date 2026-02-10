@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "source_csv": "data/blocks_full_with_types.csv",
+  "rows_source": 3233947,
+  "tip_height": 3233946,
+  "first_block_2019": 455853,
+  "built_at_utc": "2026-02-10T07:35:58.506709+00:00"
+}

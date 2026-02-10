@@ -25,11 +25,11 @@ Run flow:
 
 ## 2. Model invariants
 
-- Up to current tip (`max_height_csv`), facts from `data/blocks_full_with_types.csv` are used.
+- Up to current tip (`max_height_csv`), facts are loaded from compiled artifacts (`data/compiled/*.npz`) in runtime.
 - Historical facts are never overwritten (subsidy, fees, tx_count, issued supply, timestamps).
 - Scenario effects are applied only from `NSM activation height` onward.
 - If block range input is invalid (`start_height > end_height`), heavy model computation is skipped.
-- Partial CSV datasets are handled via safe reindex/ffill logic to avoid crashes on missing heights.
+- Runtime does not scan the large CSV; historical data is served from compact compiled artifacts.
 - Exact-mode performance guard: extremely large horizons are rejected to keep UI responsive on local machines.
 
 ## 3. ZIP logic in UI
@@ -69,9 +69,11 @@ where:
 
 - `viz/app.py` - UI, callbacks, validation, chart generation, diagnostics.
 - `viz/io.py` - YAML and CSV loading.
+- `viz/compiled_io.py` - compact compiled chain artifacts loading (`.npz` + metadata).
 - `viz/model.py` - pure modeling utilities.
 - `config/config.yaml` - chain/scenario configuration.
 - `data/blocks_full_with_types.csv` - factual base dataset.
+- `data/compile_chain.py` - offline compiler from CSV to `data/compiled/chain_v1.npz`.
 - `data/events_burn.csv` - voluntary burn events.
 - `data/update_fees_last_million.py` - `fees_zat` updater via RPC.
 - `backend/app.py` - optional FastAPI helper backend (snapshot/RPC health endpoints).
@@ -88,6 +90,8 @@ meta:
 paths:
   blocks_csv: "data/blocks_full_with_types.csv"
   events_burn_csv: "data/events_burn.csv"
+  compiled_chain_npz: "data/compiled/chain_v1.npz"
+  compiled_meta_json: "data/compiled/meta_v1.json"
 
 defaults:
   nsm_activation_height: 3566401
@@ -145,10 +149,16 @@ ui:
 model:
   activation_rules:
     enforce_from_nsm: true
+
+runtime:
+  require_compiled_chain: true
 ```
 
 Key meanings:
-- `paths.*` - CSV file paths.
+- `paths.blocks_csv` - source CSV path for offline compilation.
+- `paths.events_burn_csv` - voluntary burn events CSV.
+- `paths.compiled_chain_npz` - runtime chain source (fast path, required in production).
+- `paths.compiled_meta_json` - metadata for compiled chain artifact.
 - `defaults.nsm_activation_height` - base NSM activation height used directly by UI default.
 - `defaults.horizon_end_height` - default horizon in UI.
 - `defaults.display_start_date_utc` - default start date anchor for the visible window.
@@ -161,6 +171,7 @@ Key meanings:
 - `ui.y_axis.*` - y-axis scaling behavior.
 - `ui.markers.*` - vertical marker style and label offsets.
 - `model.activation_rules.enforce_from_nsm` - forces scenario effects to start from NSM activation.
+- `runtime.require_compiled_chain` - if `true`, app fails fast when compiled artifacts are missing/corrupted.
 
 Mainnet constants are hardcoded in code (not configurable via YAML):
 - `zatoshis_per_zec = 100_000_000`
@@ -181,6 +192,15 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
+Compile chain artifacts (required for runtime):
+
+```bash
+python data/compile_chain.py \
+  --input-csv data/blocks_full_with_types.csv \
+  --out-npz data/compiled/chain_v1.npz \
+  --out-meta data/compiled/meta_v1.json
+```
+
 Run Dash UI:
 
 ```bash
@@ -193,6 +213,8 @@ Open:
 Usage:
 - after changing any input, click `Run calculation` to update the chart;
 - if range is invalid (`start > horizon`), the run button is disabled until fixed.
+
+If compiled files are missing and `runtime.require_compiled_chain: true`, app startup/run fails by design.
 
 Optional backend (if API health/snapshot endpoints are needed):
 
@@ -208,6 +230,6 @@ Non-container setup:
 - external reverse proxy (Nginx/Caddy) on 80/443.
 
 Recommendations:
-- keep `config/config.yaml` and `data/*.csv` on persistent storage;
+- keep `config/config.yaml` and `data/compiled/*` on persistent storage;
 - run processes under `systemd` or a supervisor;
 - disable debug mode in production.

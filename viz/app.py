@@ -13,6 +13,7 @@ import math
 import os
 import traceback
 import threading
+import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Optional, Tuple
@@ -20,9 +21,11 @@ from typing import Optional, Tuple
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
-from dash import Dash, Input, Output, State, dcc, html, ctx
+from dash import Dash, Input, Output, State, dcc, html, ctx, no_update
+from flask import request
 
-from viz.io import load_blocks_csv, load_burn_events_csv, load_config, get_sprout_snapshot
+from viz.compiled_io import compiled_chain_exists, load_compiled_chain
+from viz.io import load_burn_events_csv, load_config, get_sprout_snapshot
 
 # -----------------------------
 # Protocol-ish constants
@@ -547,8 +550,10 @@ def apply_burn_reissuance_to_subsidy(
 # UI app
 # -----------------------------
 cfg = load_config("config/config.yaml")
-blocks_path = cfg.paths.blocks_csv
 events_path = cfg.paths.events_burn_csv
+compiled_chain_npz_path = cfg.paths.compiled_chain_npz
+compiled_meta_json_path = cfg.paths.compiled_meta_json
+REQUIRE_COMPILED_CHAIN = bool(cfg.runtime.require_compiled_chain)
 
 ZIP234_NUM = int(cfg.issuance.zip234.numerator)
 ZIP234_DEN = int(cfg.issuance.zip234.denominator)
@@ -614,6 +619,7 @@ _CACHE_LOCK = threading.Lock()
 _DATA_CACHE_KEY: Optional[Tuple] = None
 _DATA_CACHE_BLOCKS: Optional[pd.DataFrame] = None
 _DATA_CACHE_EVENTS: Optional[pd.DataFrame] = None
+_DATA_CACHE_INFO: dict = {}
 
 _IMMUTABLE_CACHE: dict[Tuple[Tuple, int], dict] = {}
 _IMMUTABLE_CACHE_LRU: list[Tuple[Tuple, int]] = []
@@ -630,23 +636,57 @@ def _file_sig(path: str) -> Tuple[int, int]:
 
 
 def _data_sig_key() -> Tuple:
-    return (_file_sig(blocks_path), _file_sig(events_path))
+    return (
+        "compiled-strict",
+        _file_sig(compiled_chain_npz_path),
+        _file_sig(compiled_meta_json_path),
+        _file_sig(events_path),
+    )
 
 
-def _load_data_cached() -> Tuple[pd.DataFrame, pd.DataFrame, bool]:
-    global _DATA_CACHE_KEY, _DATA_CACHE_BLOCKS, _DATA_CACHE_EVENTS
+def _load_data_cached() -> Tuple[pd.DataFrame, pd.DataFrame, bool, dict]:
+    global _DATA_CACHE_KEY, _DATA_CACHE_BLOCKS, _DATA_CACHE_EVENTS, _DATA_CACHE_INFO
     key = _data_sig_key()
     with _CACHE_LOCK:
         if _DATA_CACHE_KEY == key and _DATA_CACHE_BLOCKS is not None and _DATA_CACHE_EVENTS is not None:
-            return _DATA_CACHE_BLOCKS.copy(), _DATA_CACHE_EVENTS.copy(), True
+            return _DATA_CACHE_BLOCKS, _DATA_CACHE_EVENTS, True, dict(_DATA_CACHE_INFO)
 
-    blocks_df = load_blocks_csv(blocks_path)
+    data_source = "compiled"
+    default_start_h = 0
+    if not compiled_chain_exists(compiled_chain_npz_path):
+        if REQUIRE_COMPILED_CHAIN:
+            raise RuntimeError(
+                "Compiled chain artifact is required but missing: "
+                f"{compiled_chain_npz_path}. Run data/compile_chain.py first."
+            )
+        raise RuntimeError(
+            "Compiled chain artifact is missing. CSV runtime mode has been removed from app.py."
+        )
+
+    try:
+        compiled = load_compiled_chain(compiled_chain_npz_path, compiled_meta_json_path)
+        blocks_df = compiled.to_blocks_df()
+        data_source = f"compiled:{compiled_chain_npz_path}"
+        default_start_h = int(max(0, compiled.first_block_2019))
+    except Exception as exc:
+        raise RuntimeError(
+            "Failed to load compiled chain artifact. "
+            f"npz={compiled_chain_npz_path}, meta={compiled_meta_json_path}, error={type(exc).__name__}: {exc}"
+        ) from exc
+
     events_df = load_burn_events_csv(events_path)
+    info = {
+        "data_key": key,
+        "data_source": data_source,
+        "default_start_height": int(default_start_h),
+        "max_height_csv": int(blocks_df["height"].max()) if not blocks_df.empty else 0,
+    }
     with _CACHE_LOCK:
         _DATA_CACHE_KEY = key
-        _DATA_CACHE_BLOCKS = blocks_df.copy()
-        _DATA_CACHE_EVENTS = events_df.copy()
-    return blocks_df, events_df, False
+        _DATA_CACHE_BLOCKS = blocks_df
+        _DATA_CACHE_EVENTS = events_df
+        _DATA_CACHE_INFO = dict(info)
+    return blocks_df, events_df, False, info
 
 
 def _build_immutable_bundle(blocks_df: pd.DataFrame, bundle_end_h: int) -> dict:
@@ -696,7 +736,7 @@ def _schedule_warm_bundle(blocks_df: pd.DataFrame, data_key: Tuple, bundle_end_h
         fut = _WARM_FUTURES.get(cache_key)
         if fut is not None and not fut.done():
             return
-        _WARM_FUTURES[cache_key] = _WARM_POOL.submit(_build_immutable_bundle, blocks_df.copy(), bundle_end_h)
+        _WARM_FUTURES[cache_key] = _WARM_POOL.submit(_build_immutable_bundle, blocks_df, bundle_end_h)
 
 
 def _get_immutable_bundle(blocks_df: pd.DataFrame, end_h: int, data_key: Tuple) -> Tuple[dict, str]:
@@ -734,6 +774,51 @@ ASSETS_DIR = os.path.join(PROJECT_ROOT, "assets")
 
 app = Dash(__name__, update_title=None, assets_folder=ASSETS_DIR)
 app.title = "Zcash NSM / Burns Visualizer"
+# WSGI entrypoint for gunicorn/uWSGI.
+server = app.server
+
+
+@server.after_request
+def _disable_cache_for_dash_dynamic_routes(response):
+    """
+    Prevent stale Dash dependency/layout/update payloads from browser/CDN caches.
+    This avoids callback signature mismatches after deploys/restarts.
+    """
+    p = request.path or ""
+    if p in ("/", "/_dash-layout", "/_dash-dependencies") or p.startswith("/_dash-update-component"):
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+    return response
+
+
+def _default_applied_params() -> dict:
+    return {
+        "x_axis_mode": "date",
+        "horizon_end_height": None,
+        "start_height": None,
+        "nsm_height": DEFAULT_NSM_HEIGHT,
+        "toggles": [],
+        "future_profile": DEFAULT_FUTURE_PROFILE,
+        "future_preset": DEFAULT_FUTURE_PRESET,
+        "fee_burn_ratio": DEFAULT_FEE_BURN_RATIO,
+        "sprout_burn_amount": DEFAULT_SPROUT_ZAT,
+        "sprout_burn_height": DEFAULT_NSM_HEIGHT,
+    }
+
+
+def _sanitize_applied_params(data: Optional[dict]) -> dict:
+    params = _default_applied_params()
+    if isinstance(data, dict):
+        for k in params.keys():
+            if k in data:
+                params[k] = data[k]
+    params["toggles"] = list(params.get("toggles") or [])
+    params["x_axis_mode"] = str(params.get("x_axis_mode") or "date")
+    params["future_profile"] = str(params.get("future_profile") or DEFAULT_FUTURE_PROFILE)
+    params["future_preset"] = str(params.get("future_preset") or DEFAULT_FUTURE_PRESET)
+    return params
+
 
 app.layout = html.Div(
     style={"fontFamily": "system-ui, -apple-system, Segoe UI, Roboto, sans-serif", "padding": "14px"},
@@ -930,7 +1015,17 @@ app.layout = html.Div(
                 ),
             ],
         ),
-        dcc.Interval(id="interval_refresh", interval=800, n_intervals=0),
+        dcc.Store(
+            id="session_uid",
+            storage_type="session",
+            data=None,
+        ),
+        dcc.Store(
+            id="applied_params",
+            storage_type="memory",
+            data=_default_applied_params(),
+        ),
+        dcc.Interval(id="interval_refresh", interval=1200, n_intervals=0),
     ],
 )
 
@@ -1034,13 +1129,66 @@ def nudge_start_by_million(_minus, _plus, start_value):
 
 
 @app.callback(
+    Output("session_uid", "data"),
+    Input("interval_refresh", "n_intervals"),
+    State("session_uid", "data"),
+)
+def ensure_session_uid(_tick, session_uid):
+    if session_uid:
+        return no_update
+    return uuid.uuid4().hex
+
+
+@app.callback(
+    Output("applied_params", "data"),
+    Input("run_calc", "n_clicks"),
+    State("x_axis_mode", "value"),
+    State("horizon_end_height", "value"),
+    State("start_height", "value"),
+    State("nsm_height", "value"),
+    State("toggles", "value"),
+    State("future_profile", "value"),
+    State("future_preset", "value"),
+    State("fee_burn_ratio", "value"),
+    State("sprout_burn_amount", "value"),
+    State("sprout_burn_height", "value"),
+)
+def apply_run_params(
+    _run_clicks,
+    x_axis_mode,
+    horizon_end_height,
+    start_height,
+    nsm_height,
+    toggles,
+    future_profile,
+    future_preset,
+    fee_burn_ratio,
+    sprout_burn_amount,
+    sprout_burn_height,
+):
+    return {
+        "x_axis_mode": x_axis_mode,
+        "horizon_end_height": horizon_end_height,
+        "start_height": start_height,
+        "nsm_height": nsm_height,
+        "toggles": list(toggles or []),
+        "future_profile": future_profile,
+        "future_preset": future_preset,
+        "fee_burn_ratio": fee_burn_ratio,
+        "sprout_burn_amount": sprout_burn_amount,
+        "sprout_burn_height": sprout_burn_height,
+    }
+
+
+@app.callback(
     Output("run_calc", "style"),
     Output("run_calc", "children"),
     Output("run_hint", "children"),
     Output("run_hint", "style"),
     Output("run_calc", "disabled"),
     Input("interval_refresh", "n_intervals"),
-    Input("run_calc", "n_clicks"),
+    Input("session_uid", "data"),
+    Input("applied_params", "data"),
     Input("x_axis_mode", "value"),
     Input("horizon_end_height", "value"),
     Input("start_height", "value"),
@@ -1054,7 +1202,8 @@ def nudge_start_by_million(_minus, _plus, start_value):
 )
 def sync_run_button_state(
     _tick,
-    _run_clicks,
+    session_uid,
+    applied_params,
     x_axis_mode,
     horizon_end_height,
     start_height,
@@ -1066,6 +1215,15 @@ def sync_run_button_state(
     sprout_burn_amount,
     sprout_burn_height,
 ):
+    if not session_uid:
+        return (
+            _run_button_running_style(),
+            "Initializing session...",
+            "Waiting for per-browser session initialization.",
+            _run_hint_running_style(),
+            True,
+        )
+
     effective_horizon = _to_int(horizon_end_height, DEFAULT_HORIZON_HEIGHT)
     effective_horizon = max(0, effective_horizon)
     invalid_range = False
@@ -1086,6 +1244,7 @@ def sync_run_button_state(
         )
 
     current_key = _build_request_key(
+        session_uid=session_uid,
         x_axis_mode=x_axis_mode,
         horizon_end_height=horizon_end_height,
         start_height=start_height,
@@ -1097,10 +1256,23 @@ def sync_run_button_state(
         sprout_burn_amount=sprout_burn_amount,
         sprout_burn_height=sprout_burn_height,
     )
+    applied = _sanitize_applied_params(applied_params)
+    applied_key = _build_request_key(
+        session_uid=session_uid,
+        x_axis_mode=applied["x_axis_mode"],
+        horizon_end_height=applied["horizon_end_height"],
+        start_height=applied["start_height"],
+        nsm_height=applied["nsm_height"],
+        toggles=applied["toggles"],
+        future_profile=applied["future_profile"],
+        future_preset=applied["future_preset"],
+        fee_burn_ratio=applied["fee_burn_ratio"],
+        sprout_burn_amount=applied["sprout_burn_amount"],
+        sprout_burn_height=applied["sprout_burn_height"],
+    )
     with _CALC_LOCK:
-        active_key = _ACTIVE_REQUEST_KEY
-        active_future = _CALC_FUTURES.get(active_key) if active_key is not None else None
-    dirty = active_key is None or current_key != active_key
+        active_future = _CALC_FUTURES.get(applied_key)
+    dirty = current_key != applied_key
     running = bool(active_future is not None and not active_future.done())
 
     if dirty:
@@ -1128,15 +1300,13 @@ def sync_run_button_state(
     )
 
 
-_CALC_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="nsm-calc")
+CALC_POOL_WORKERS = max(2, min(4, (os.cpu_count() or 2)))
+_CALC_POOL = ThreadPoolExecutor(max_workers=CALC_POOL_WORKERS, thread_name_prefix="nsm-calc")
 _CALC_LOCK = threading.Lock()
 _CALC_FUTURES: dict[Tuple, Future] = {}
 _CALC_RESULTS: dict[Tuple, Tuple[str, go.Figure, str]] = {}
 _CALC_RESULTS_LRU: list[Tuple] = []
 _CALC_RESULTS_MAX = 12
-_LAST_RENDERED_RESULT: Optional[Tuple[str, go.Figure, str]] = None
-_ACTIVE_REQUEST_KEY: Optional[Tuple] = None
-_CALC_ARGS_BY_KEY: dict[Tuple, Tuple] = {}
 
 
 def _run_button_base_style() -> dict:
@@ -1204,7 +1374,6 @@ def _chart_wrap_busy_style() -> dict:
 
 
 def _store_calc_result(key: Tuple, result: Tuple[str, go.Figure, str]) -> None:
-    global _LAST_RENDERED_RESULT
     with _CALC_LOCK:
         _CALC_RESULTS[key] = result
         if key in _CALC_RESULTS_LRU:
@@ -1213,10 +1382,10 @@ def _store_calc_result(key: Tuple, result: Tuple[str, go.Figure, str]) -> None:
         while len(_CALC_RESULTS_LRU) > _CALC_RESULTS_MAX:
             old = _CALC_RESULTS_LRU.pop(0)
             _CALC_RESULTS.pop(old, None)
-        _LAST_RENDERED_RESULT = result
 
 
 def _build_request_key(
+    session_uid,
     x_axis_mode,
     horizon_end_height,
     start_height,
@@ -1245,31 +1414,19 @@ def _build_request_key(
 
 def _render_pending_state(req_key: Tuple) -> Tuple[str, go.Figure, str]:
     with _CALC_LOCK:
-        last = _LAST_RENDERED_RESULT
         pending = list(_CALC_FUTURES.keys())
-    if last is None:
-        fig = go.Figure()
-        fig.update_layout(
-            title=None,
-            xaxis_title="Date (UTC)",
-            yaxis_title="Inflation (%/year)",
-        )
-        diag = (
-            "calculation in progress:\n"
-            "- waiting for first completed result.\n"
-            f"- active jobs: {len(pending)}\n"
-            f"- request key hash: {hash(req_key)}"
-        )
-        return "Zcash Inflation Chart - Calculating", fig, diag
-    title, fig, diag = last
-    diag_pending = (
+    fig = go.Figure()
+    fig.update_layout(
+        title=None,
+        xaxis_title="Date (UTC)",
+        yaxis_title="Inflation (%/year)",
+    )
+    diag = (
         "calculation in progress:\n"
         f"- active jobs: {len(pending)}\n"
-        f"- request key hash: {hash(req_key)}\n\n"
-        "last completed result:\n"
-        f"{diag}"
+        f"- request key hash: {hash(req_key)}"
     )
-    return title, fig, diag_pending
+    return "Zcash Inflation Chart - Calculating", fig, diag
 
 
 def _compute_chart_sync(
@@ -1331,24 +1488,10 @@ def _compute_chart_sync(
             )
 
         # Load data with mtime/size-aware cache.
-        blocks_df, burn_events_df, data_cache_hit = _load_data_cached()
-
-        blocks_df = blocks_df.copy()
-        blocks_df["height"] = pd.to_numeric(blocks_df["height"], errors="coerce").fillna(0).astype(int)
-        blocks_df = blocks_df.sort_values("height")
-
-        max_height_csv = int(blocks_df["height"].max()) if not blocks_df.empty else 0
-
-        # default display start: first block on/after configured start date
-        if "time_utc" in blocks_df.columns and not blocks_df.empty:
-            t = pd.to_datetime(blocks_df["time_utc"], utc=True, errors="coerce")
-            m2019 = t >= DISPLAY_START_DATE_UTC
-            if bool(m2019.any()):
-                default_start_h = int(blocks_df.loc[m2019, "height"].iloc[0])
-            else:
-                default_start_h = 0
-        else:
-            default_start_h = 0
+        blocks_df, burn_events_df, data_cache_hit, data_info = _load_data_cached()
+        max_height_csv = int(data_info.get("max_height_csv", 0))
+        default_start_h = int(data_info.get("default_start_height", 0))
+        data_source = str(data_info.get("data_source", "csv"))
 
         # horizon: default anchored at 3rd halving height
         user_end_h = DEFAULT_HORIZON_HEIGHT if horizon_end_height is None else _to_int(horizon_end_height, DEFAULT_HORIZON_HEIGHT)
@@ -1381,6 +1524,7 @@ def _compute_chart_sync(
         base_issued = immutable_bundle["base_issued"][: end_h + 1]
         parse_notes.append(immutable_note)
         parse_notes.append(f"data cache: {'hit' if data_cache_hit else 'miss'}")
+        parse_notes.append(f"data source: {data_source}")
 
         # Scenario subsidy (ZIP234 or baseline)
         enable_zip234 = "zip234" in toggles
@@ -1662,7 +1806,7 @@ def _compute_chart_sync(
 
         # Diagnostics
         diag_lines = [
-            f"blocks_csv: {blocks_path}",
+            f"chain data source: {data_source}",
             f"max_height_csv: {max_height_csv}",
             f"end_height requested: {user_end_h}",
             f"end_height effective: {end_h}",
@@ -1786,72 +1930,88 @@ def _compute_chart_sync(
     Output("calc_status", "children"),
     Output("calc_status", "style"),
     Output("chart_wrap", "style"),
+    Output("interval_refresh", "disabled"),
     Input("interval_refresh", "n_intervals"),
-    Input("run_calc", "n_clicks"),
-    State("x_axis_mode", "value"),
-    State("horizon_end_height", "value"),
-    State("start_height", "value"),
-    State("nsm_height", "value"),
-    State("toggles", "value"),
-    State("future_profile", "value"),
-    State("future_preset", "value"),
-    State("fee_burn_ratio", "value"),
-    State("sprout_burn_amount", "value"),
-    State("sprout_burn_height", "value"),
+    Input("session_uid", "data"),
+    Input("applied_params", "data"),
 )
 def update_chart(
     _tick,
-    _run_clicks,
-    x_axis_mode,
-    horizon_end_height,
-    start_height,
-    nsm_height,
-    toggles,
-    future_profile,
-    future_preset,
-    fee_burn_ratio,
-    sprout_burn_amount,
-    sprout_burn_height,
+    session_uid,
+    applied_params,
 ):
-    global _ACTIVE_REQUEST_KEY
+    if not session_uid:
+        fig = go.Figure()
+        fig.update_layout(title=None, xaxis_title="Date (UTC)", yaxis_title="Inflation (%/year)")
+        return (
+            "Zcash Inflation Chart - Initializing Session",
+            fig,
+            "session initialization in progress...",
+            "Status: preparing...",
+            {"margin": "0 0 6px 0", "fontSize": "13px", "fontWeight": "600", "color": "#8a4b00"},
+            _chart_wrap_busy_style(),
+            False,
+        )
 
-    req_args = (
-        _tick,
-        x_axis_mode,
-        horizon_end_height,
-        start_height,
-        nsm_height,
-        toggles,
-        future_profile,
-        future_preset,
-        fee_burn_ratio,
-        sprout_burn_amount,
-        sprout_burn_height,
+    applied = _sanitize_applied_params(applied_params)
+    x_axis_mode = applied["x_axis_mode"]
+    horizon_end_height = applied["horizon_end_height"]
+    start_height = applied["start_height"]
+    nsm_height = applied["nsm_height"]
+    toggles = applied["toggles"]
+    future_profile = applied["future_profile"]
+    future_preset = applied["future_preset"]
+    fee_burn_ratio = applied["fee_burn_ratio"]
+    sprout_burn_amount = applied["sprout_burn_amount"]
+    sprout_burn_height = applied["sprout_burn_height"]
+
+    req_key = _build_request_key(
+        session_uid=session_uid,
+        x_axis_mode=x_axis_mode,
+        horizon_end_height=horizon_end_height,
+        start_height=start_height,
+        nsm_height=nsm_height,
+        toggles=toggles,
+        future_profile=future_profile,
+        future_preset=future_preset,
+        fee_burn_ratio=fee_burn_ratio,
+        sprout_burn_amount=sprout_burn_amount,
+        sprout_burn_height=sprout_burn_height,
     )
 
-    trigger = ctx.triggered_id
-    if trigger == "run_calc" or _ACTIVE_REQUEST_KEY is None:
-        req_key = _build_request_key(
-            x_axis_mode=x_axis_mode,
-            horizon_end_height=horizon_end_height,
-            start_height=start_height,
-            nsm_height=nsm_height,
-            toggles=toggles,
-            future_profile=future_profile,
-            future_preset=future_preset,
-            fee_burn_ratio=fee_burn_ratio,
-            sprout_burn_amount=sprout_burn_amount,
-            sprout_burn_height=sprout_burn_height,
-        )
-        _ACTIVE_REQUEST_KEY = req_key
-        with _CALC_LOCK:
-            _CALC_ARGS_BY_KEY[req_key] = req_args
-    else:
-        req_key = _ACTIVE_REQUEST_KEY
-
+    completed_jobs: list[Tuple[Tuple, Tuple[str, go.Figure, str]]] = []
     with _CALC_LOCK:
+        # Collect finished jobs globally so they are not stranded if the original
+        # requester stopped polling. This prevents starvation in multi-user usage.
+        for k, f in list(_CALC_FUTURES.items()):
+            if not f.done():
+                continue
+            try:
+                res = f.result()
+            except Exception:
+                err_fig = go.Figure()
+                err_fig.update_layout(
+                    title="Zcash Supply (error; see diagnostics)",
+                    xaxis_title="Height",
+                    yaxis_title="ZEC",
+                )
+                res = (
+                    "Zcash Inflation Chart - Error (see Diagnostics)",
+                    err_fig,
+                    traceback.format_exc(),
+                )
+            _CALC_FUTURES.pop(k, None)
+            completed_jobs.append((k, res))
         ready = _CALC_RESULTS.get(req_key)
         fut = _CALC_FUTURES.get(req_key)
+
+    for k, res in completed_jobs:
+        _store_calc_result(k, res)
+
+    if ready is None and completed_jobs:
+        with _CALC_LOCK:
+            ready = _CALC_RESULTS.get(req_key)
+            fut = _CALC_FUTURES.get(req_key)
 
     if ready is not None:
         return (
@@ -1861,6 +2021,7 @@ def update_chart(
             "Status: ready",
             {"margin": "0 0 6px 0", "fontSize": "13px", "fontWeight": "600", "color": "#1b5e20"},
             _chart_wrap_ready_style(),
+            True,
         )
 
     if fut is not None:
@@ -1889,6 +2050,7 @@ def update_chart(
                 "Status: ready",
                 {"margin": "0 0 6px 0", "fontSize": "13px", "fontWeight": "600", "color": "#1b5e20"},
                 _chart_wrap_ready_style(),
+                True,
             )
         pending = _render_pending_state(req_key)
         return (
@@ -1898,17 +2060,39 @@ def update_chart(
             "Status: calculating...",
             {"margin": "0 0 6px 0", "fontSize": "13px", "fontWeight": "600", "color": "#8a4b00"},
             _chart_wrap_busy_style(),
+            False,
         )
 
+    submitted = False
     with _CALC_LOCK:
-        for k, old_f in list(_CALC_FUTURES.items()):
-            if k != req_key and not old_f.running() and not old_f.done():
-                old_f.cancel()
-                _CALC_FUTURES.pop(k, None)
-        args = _CALC_ARGS_BY_KEY.get(req_key, req_args)
-        _CALC_FUTURES[req_key] = _CALC_POOL.submit(
-            _compute_chart_sync,
-            *args,
+        existing = _CALC_FUTURES.get(req_key)
+        if existing is None or existing.done():
+            _CALC_FUTURES[req_key] = _CALC_POOL.submit(
+                _compute_chart_sync,
+                0,
+                x_axis_mode,
+                horizon_end_height,
+                start_height,
+                nsm_height,
+                toggles,
+                future_profile,
+                future_preset,
+                fee_burn_ratio,
+                sprout_burn_amount,
+                sprout_burn_height,
+            )
+            submitted = True
+
+    if not submitted:
+        pending = _render_pending_state(req_key)
+        return (
+            pending[0],
+            pending[1],
+            pending[2],
+            "Status: calculating...",
+            {"margin": "0 0 6px 0", "fontSize": "13px", "fontWeight": "600", "color": "#8a4b00"},
+            _chart_wrap_busy_style(),
+            False,
         )
     pending = _render_pending_state(req_key)
     return (
@@ -1918,6 +2102,7 @@ def update_chart(
         "Status: calculating...",
         {"margin": "0 0 6px 0", "fontSize": "13px", "fontWeight": "600", "color": "#8a4b00"},
         _chart_wrap_busy_style(),
+        False,
     )
 
 

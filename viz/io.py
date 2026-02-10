@@ -22,6 +22,8 @@ import yaml
 class PathsConfig:
     blocks_csv: str
     events_burn_csv: str
+    compiled_chain_npz: str
+    compiled_meta_json: str
 
 
 @dataclass(frozen=True)
@@ -120,6 +122,11 @@ class ModelConfig:
 
 
 @dataclass(frozen=True)
+class RuntimeConfig:
+    require_compiled_chain: bool
+
+
+@dataclass(frozen=True)
 class MetaConfig:
     name: str
     version: int
@@ -136,6 +143,7 @@ class AppConfig:
     future_activity: FutureActivityConfig
     ui: UiConfig
     model: ModelConfig
+    runtime: RuntimeConfig
 
 
 # -----------------------------
@@ -166,7 +174,14 @@ def load_config(path: str) -> AppConfig:
     # paths
     blocks_csv = str(_dget(raw, "paths.blocks_csv", "data/blocks_full_with_types.csv"))
     events_burn_csv = str(_dget(raw, "paths.events_burn_csv", "data/events_burn.csv"))
-    paths_cfg = PathsConfig(blocks_csv=blocks_csv, events_burn_csv=events_burn_csv)
+    compiled_chain_npz = str(_dget(raw, "paths.compiled_chain_npz", "data/compiled/chain_v1.npz"))
+    compiled_meta_json = str(_dget(raw, "paths.compiled_meta_json", "data/compiled/meta_v1.json"))
+    paths_cfg = PathsConfig(
+        blocks_csv=blocks_csv,
+        events_burn_csv=events_burn_csv,
+        compiled_chain_npz=compiled_chain_npz,
+        compiled_meta_json=compiled_meta_json,
+    )
 
     # defaults
     nsm_activation_height = int(_dget(raw, "defaults.nsm_activation_height", 3_566_400))
@@ -259,6 +274,9 @@ def load_config(path: str) -> AppConfig:
             enforce_from_nsm=bool(_dget(raw, "model.activation_rules.enforce_from_nsm", True))
         )
     )
+    runtime_cfg = RuntimeConfig(
+        require_compiled_chain=bool(_dget(raw, "runtime.require_compiled_chain", True))
+    )
 
     return AppConfig(
         meta=meta,
@@ -270,6 +288,7 @@ def load_config(path: str) -> AppConfig:
         future_activity=future_cfg,
         ui=ui_cfg,
         model=model_cfg,
+        runtime=runtime_cfg,
     )
 
 

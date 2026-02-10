@@ -5,6 +5,8 @@ meta:
 paths:
   blocks_csv: "data/blocks_full_with_types.csv"
   events_burn_csv: "data/events_burn.csv"
+  compiled_chain_npz: "data/compiled/chain_v1.npz"
+  compiled_meta_json: "data/compiled/meta_v1.json"
 
 defaults:
   nsm_activation_height: 3566401
@@ -62,3 +64,6 @@ ui:
 model:
   activation_rules:
     enforce_from_nsm: true
+
+runtime:
+  require_compiled_chain: true
