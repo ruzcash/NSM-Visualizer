@@ -49,6 +49,7 @@ ZIP233_DEPENDENT_TOGGLES = {"fee_burn", "sprout_burn", "voluntary_burns"}
 MAX_EXACT_END_HEIGHT = 12_000_000
 IMMUTABLE_BUCKET_SIZE = 250_000
 IMMUTABLE_CACHE_MAX_BUCKETS = 32
+AUDIT_FORCE_HEIGHT_THRESHOLD = 7_000_000
 
 
 # -----------------------------
@@ -1010,7 +1011,10 @@ app.layout = html.Div(
                 html.Div(
                     children=[
                         html.H4("Diagnostics"),
-                        html.Pre(id="diag", style={"whiteSpace": "pre-wrap", "fontSize": "12px"}),
+                        html.Pre(
+                            id="diag",
+                            style={"whiteSpace": "pre", "overflowX": "auto", "fontSize": "12px"},
+                        ),
                     ]
                 ),
             ],
@@ -1858,27 +1862,54 @@ def _compute_chart_sync(
                 int(end_h),
             }
         )
+        if int(end_h) >= AUDIT_FORCE_HEIGHT_THRESHOLD and int(DEFAULT_HORIZON_HEIGHT) <= int(end_h):
+            checkpoint_heights = sorted(set(checkpoint_heights + [int(DEFAULT_HORIZON_HEIGHT)]))
+        # Fixed-width compact columns keep audit values strictly under headers.
+        height_labels = [
+            (f"*{hh}" if hh == int(nsm_h) else f" {hh}")
+            for hh in checkpoint_heights
+        ]
+        height_col_w = max(len("height"), max(len(lbl) for lbl in height_labels))
+        base_col_w = max(len("baseline_%"), 11)
+        scen_col_w = max(len("scenario_%"), 11)
+        burned_col_w = max(len("burned_zec"), 11)
+        reissued_col_w = max(len("reissued_zec"), 11)
+        net_col_w = max(len("net_removed_zec"), 11)
+
+        audit_header = (
+            f"{'height':>{height_col_w}}|"
+            f"{'baseline_%':>{base_col_w}}|"
+            f"{'scenario_%':>{scen_col_w}}|"
+            f"{'burned_zec':>{burned_col_w}}|"
+            f"{'reissued_zec':>{reissued_col_w}}|"
+            f"{'net_removed_zec':>{net_col_w}}"
+        )
         diag_lines += [
             "",
             "scenario audit (selected heights):",
-            "height | baseline_% | scenario_% | delta_pp | burned_zec | reissued_zec | net_removed_zec",
+            audit_header,
         ]
         for hh in checkpoint_heights:
             base_v = float(base_infl_full[hh])
             scen_v = float(scen_infl_full[hh])
-            delta_v = float(reduction_pp_full[hh])
             burned_zec = float(scenario_burned[hh]) / ZATOSHIS_PER_ZEC
             reissued_zec = float(reissued_cum[hh]) / ZATOSHIS_PER_ZEC
             net_removed_zec = burned_zec - reissued_zec
             marker = "*" if hh == int(nsm_h) else " "
+            h_label = f"{marker}{hh}"
             diag_lines.append(
-                f"{marker}{hh} | {base_v:.6f} | {scen_v:.6f} | {delta_v:.6f} | "
-                f"{burned_zec:.8f} | {reissued_zec:.8f} | {net_removed_zec:.8f}"
+                f"{h_label:>{height_col_w}}|"
+                f"{base_v:>{base_col_w}.3f}|"
+                f"{scen_v:>{scen_col_w}.3f}|"
+                f"{burned_zec:>{burned_col_w}.3f}|"
+                f"{reissued_zec:>{reissued_col_w}.3f}|"
+                f"{net_removed_zec:>{net_col_w}.3f}"
             )
 
         # Help explain "no visible change" cases.
         diff_window = np.abs((scen_infl_full - base_infl_full)[start_h : end_h + 1])
         max_diff_pp = float(np.nanmax(diff_window)) if diff_window.size else 0.0
+        diag_lines.append("")
         diag_lines.append(f"max observed delta in window: {max_diff_pp:.12f} pp/yr")
         if max_diff_pp < 1e-12 and len(toggles) > 0:
             diag_lines.append("no visible scenario change: active options do not alter this selected window.")
@@ -1891,6 +1922,7 @@ def _compute_chart_sync(
             if "reissue_burned" in toggles and not enable_reissue_burned:
                 diag_lines.append("- Burn reissue requires ZIP 233 + ZIP 234 and at least one active burn source.")
         if parse_notes:
+            diag_lines.append("")
             diag_lines.append("parsing/normalization:")
             for note in parse_notes:
                 diag_lines.append(f"- {note}")
@@ -1930,7 +1962,6 @@ def _compute_chart_sync(
     Output("calc_status", "children"),
     Output("calc_status", "style"),
     Output("chart_wrap", "style"),
-    Output("interval_refresh", "disabled"),
     Input("interval_refresh", "n_intervals"),
     Input("session_uid", "data"),
     Input("applied_params", "data"),
@@ -1950,7 +1981,6 @@ def update_chart(
             "Status: preparing...",
             {"margin": "0 0 6px 0", "fontSize": "13px", "fontWeight": "600", "color": "#8a4b00"},
             _chart_wrap_busy_style(),
-            False,
         )
 
     applied = _sanitize_applied_params(applied_params)
@@ -2021,7 +2051,6 @@ def update_chart(
             "Status: ready",
             {"margin": "0 0 6px 0", "fontSize": "13px", "fontWeight": "600", "color": "#1b5e20"},
             _chart_wrap_ready_style(),
-            True,
         )
 
     if fut is not None:
@@ -2050,7 +2079,6 @@ def update_chart(
                 "Status: ready",
                 {"margin": "0 0 6px 0", "fontSize": "13px", "fontWeight": "600", "color": "#1b5e20"},
                 _chart_wrap_ready_style(),
-                True,
             )
         pending = _render_pending_state(req_key)
         return (
@@ -2060,7 +2088,6 @@ def update_chart(
             "Status: calculating...",
             {"margin": "0 0 6px 0", "fontSize": "13px", "fontWeight": "600", "color": "#8a4b00"},
             _chart_wrap_busy_style(),
-            False,
         )
 
     submitted = False
@@ -2092,7 +2119,6 @@ def update_chart(
             "Status: calculating...",
             {"margin": "0 0 6px 0", "fontSize": "13px", "fontWeight": "600", "color": "#8a4b00"},
             _chart_wrap_busy_style(),
-            False,
         )
     pending = _render_pending_state(req_key)
     return (
@@ -2102,8 +2128,26 @@ def update_chart(
         "Status: calculating...",
         {"margin": "0 0 6px 0", "fontSize": "13px", "fontWeight": "600", "color": "#8a4b00"},
         _chart_wrap_busy_style(),
-        False,
     )
+
+
+@app.callback(
+    Output("interval_refresh", "disabled"),
+    Input("calc_status", "children"),
+    Input("session_uid", "data"),
+)
+def sync_interval_polling(calc_status, session_uid):
+    """
+    Keep interval polling enabled only while preparing/calculating.
+    This callback is separated from update_chart to keep backward-compatible
+    callback output signature across deployments.
+    """
+    if not session_uid:
+        return False
+    status = str(calc_status or "").lower()
+    if "calculating" in status or "preparing" in status:
+        return False
+    return True
 
 
 if __name__ == "__main__":
