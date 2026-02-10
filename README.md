@@ -70,7 +70,6 @@ where:
 - `viz/app.py` - UI, callbacks, validation, chart generation, diagnostics.
 - `viz/io.py` - YAML and CSV loading.
 - `viz/compiled_io.py` - compact compiled chain artifacts loading (`.npz` + metadata).
-- `viz/model.py` - pure modeling utilities.
 - `config/config.yaml` - chain/scenario configuration.
 - `data/blocks_full_with_types.csv` - factual base dataset.
 - `data/compile_chain.py` - offline compiler from CSV to `data/compiled/chain_v1.npz`.

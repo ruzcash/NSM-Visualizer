@@ -3,8 +3,6 @@ plotly>=5.18.0
 pandas>=2.2.0
 numpy>=1.26.0
 PyYAML>=6.0.1
-# Used by data/update_fees_last_million.py
-requests>=2.31.0
 
 # Optional backend API
 fastapi>=0.110.0
